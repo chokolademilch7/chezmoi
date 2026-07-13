@@ -4,5 +4,10 @@
 exec chezmoi upgrade --executable=$WORK${/}chezmoi$exe --method=replace-executable
 exec $WORK/chezmoi$exe --version
 
+# test that chezmoi upgrade --verbose prints the before and after versions
+exec chezmoi upgrade --executable=$WORK${/}chezmoi$exe --force  --method=replace-executable --verbose upgrade
+stdout ^before:
+stdout ^after:
+
 -- chezmoi --
 -- chezmoi.exe --
