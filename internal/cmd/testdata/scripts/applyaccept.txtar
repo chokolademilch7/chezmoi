@@ -1,0 +1,63 @@
+# apply writes all targets and records their last-written state
+exec chezmoi apply --force
+
+# test that accept on a modified regular file re-adds the destination edit into
+# the source after apply completes, leaving the destination untouched mid-run
+edit $HOME/.file
+stdin golden/accept
+exec chezmoi apply --no-tty $HOME${/}.file
+stdout 're-added \.file'
+grep '# edited' $CHEZMOISOURCEDIR/dot_file
+grep '# edited' $HOME/.file
+
+# test that a second apply sees no conflict now that source matches destination
+exec chezmoi apply --no-tty $HOME${/}.file
+! stdout .
+
+# test that a single all-accept answer re-adds every subsequent dirty file and
+# that a clean (non-conflicting) file is never enqueued
+edit $HOME/.a
+edit $HOME/.b
+stdin golden/all-accept
+exec chezmoi apply --no-tty $HOME${/}.a $HOME${/}.b $HOME${/}.clean
+stdout 're-added \.a'
+stdout 're-added \.b'
+! stdout 're-added \.clean'
+grep '# edited' $CHEZMOISOURCEDIR/dot_a
+grep '# edited' $CHEZMOISOURCEDIR/dot_b
+! grep '# edited' $CHEZMOISOURCEDIR/dot_clean
+
+# test that accept on a templated target warns and leaves the template unmodified
+edit $HOME/.tmpl
+stdin golden/accept
+exec chezmoi apply --no-tty $HOME${/}.tmpl
+stderr 'not re-adding: source is a template'
+! grep '# edited' $CHEZMOISOURCEDIR/dot_tmpl.tmpl
+cmp $CHEZMOISOURCEDIR/dot_tmpl.tmpl golden/dot_tmpl.tmpl
+
+# test that accept under --dry-run reports "would re-add" and does not write source
+edit $HOME/.dry
+stdin golden/accept
+exec chezmoi apply --dry-run --no-tty $HOME${/}.dry
+stdout 'would re-add \.dry'
+! stdout 're-added'
+! grep '# edited' $CHEZMOISOURCEDIR/dot_dry
+
+-- golden/accept --
+accept
+-- golden/all-accept --
+all-accept
+-- golden/dot_tmpl.tmpl --
+{{ "# contents of .tmpl" }}
+-- home/user/.local/share/chezmoi/dot_a --
+# contents of .a
+-- home/user/.local/share/chezmoi/dot_b --
+# contents of .b
+-- home/user/.local/share/chezmoi/dot_clean --
+# contents of .clean
+-- home/user/.local/share/chezmoi/dot_dry --
+# contents of .dry
+-- home/user/.local/share/chezmoi/dot_file --
+# contents of .file
+-- home/user/.local/share/chezmoi/dot_tmpl.tmpl --
+{{ "# contents of .tmpl" }}

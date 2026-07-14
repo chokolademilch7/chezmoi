@@ -200,6 +200,8 @@ type Config struct {
 	debug            bool
 	dryRun           bool
 	force            bool
+	acceptAll        bool              // set by the all-accept conflict choice; mirrors force's per-run lifecycle
+	acceptedTargets  []chezmoi.RelPath // targets queued by accept/all-accept, drained into the source state after apply
 	homeDir          string
 	keepGoing        bool
 	noPager          bool
@@ -756,6 +758,7 @@ func (c *Config) applyArgs(
 		case err != nil:
 			err = fmt.Errorf("%s: %w", targetRelPath, err)
 			if !c.keepGoing {
+				c.warnDroppedAcceptedTargets()
 				return err
 			}
 			c.errorf("%v\n", err)
@@ -768,6 +771,16 @@ func (c *Config) applyArgs(
 		c.errorf("%v\n", err)
 		keptGoingAfterErr = true
 	case err != nil:
+		c.warnDroppedAcceptedTargets()
+		return err
+	}
+
+	// Drain targets queued by the accept/all-accept conflict choices into the
+	// source state. This runs after the apply loop and PostApply (so source
+	// mutation happens strictly after the destination is updated) and before the
+	// keptGoingAfterErr check (so accepted files, which were legitimately
+	// skipped and are independent of any --keep-going error, are still re-added).
+	if err := c.drainAcceptedTargets(sourceState); err != nil {
 		return err
 	}
 
@@ -776,6 +789,54 @@ func (c *Config) applyArgs(
 	}
 
 	return nil
+}
+
+// drainAcceptedTargets re-adds the targets queued by the accept/all-accept
+// conflict choices (see defaultPreApplyFunc) into sourceState. It writes through
+// c.baseSystem, the underlying writable source system, because c.sourceSystem is
+// read-only wrapped during apply; adding the modifiesSourceDirectory annotation
+// to enable writes instead would trigger git auto-commit/push on every apply.
+// Only defaultPreApplyFunc enqueues, and only for regular-file conflicts, so
+// commands passing a different or no preApplyFunc (diff, status, verify, dump,
+// etc.) never populate the queue and remain source-safe by construction.
+func (c *Config) drainAcceptedTargets(sourceState *chezmoi.SourceState) error {
+	if len(c.acceptedTargets) == 0 {
+		return nil
+	}
+	targetRelPaths := c.acceptedTargets
+	c.acceptedTargets = nil
+
+	if c.dryRun {
+		// The drain writes through raw c.baseSystem, bypassing the dry-run
+		// wrapping applied to c.sourceSystem, so it must not run under --dry-run.
+		for _, targetRelPath := range targetRelPaths {
+			fmt.Fprintf(c.stdout, "would re-add %s\n", targetRelPath)
+		}
+		return nil
+	}
+
+	sourceStateEntries := make(map[chezmoi.RelPath]chezmoi.SourceStateEntry)
+	for _, targetRelPath := range targetRelPaths {
+		sourceStateEntries[targetRelPath] = sourceState.Get(targetRelPath)
+	}
+
+	processedFiles, err := c.reAddTargetRelPaths(sourceState, targetRelPaths, sourceStateEntries, c.baseSystem, true)
+	for _, targetRelPath := range targetRelPaths {
+		if processedFiles[targetRelPath] {
+			fmt.Fprintf(c.stdout, "re-added %s\n", targetRelPath)
+		}
+	}
+	return err
+}
+
+// warnDroppedAcceptedTargets warns that targets queued by the accept/all-accept
+// conflict choices are being dropped because apply is returning early (before
+// the drain runs).
+func (c *Config) warnDroppedAcceptedTargets() {
+	for _, targetRelPath := range c.acceptedTargets {
+		c.errorf("warning: %s: accepted but not re-added: apply did not complete\n", targetRelPath)
+	}
+	c.acceptedTargets = nil
 }
 
 // builtinDiffFile outputs the diff between fromData and fromMode and toData and
@@ -1159,11 +1220,26 @@ func (c *Config) defaultPreApplyFunc(
 		}
 	}
 
+	// acceptFile reports whether the accept/all-accept choices apply to this
+	// conflict. Accept is offered and honored only for regular-file targets: a
+	// queued directory or symlink would be fs.SkipDir'd during apply (skipping
+	// the whole subtree) yet never re-added by the file-only re-add drain,
+	// producing a silent no-op.
+	acceptFile := targetEntryState.Type == chezmoi.EntryStateTypeFile
+
 	switch {
 	case mode == promptNone:
 		return nil
 	case mode == promptConflict && c.errorOnConflict:
 		return chezmoi.ExitCodeError(1)
+	case mode == promptConflict && c.acceptAll && acceptFile:
+		// all-accept was chosen earlier this run: skip this regular-file target
+		// during apply and queue it to be re-added into the source state after
+		// the apply loop completes. Placed here (after the promptConflict mode
+		// has been resolved) so that clean, non-conflicting files are never
+		// enqueued.
+		c.acceptedTargets = append(c.acceptedTargets, targetRelPath)
+		return fs.SkipDir
 	}
 
 	// Now prompt based on choice made above
@@ -1178,7 +1254,11 @@ func (c *Config) defaultPreApplyFunc(
 		choices = append(choices, choicesYesNoAllQuit...)
 		promptText = fmt.Sprintf("Apply %s", targetRelPath)
 	} else {
-		choices = append(choices, choicesOverwrite...)
+		if acceptFile {
+			choices = append(choices, choicesOverwriteAccept...)
+		} else {
+			choices = append(choices, choicesOverwrite...)
+		}
 		if targetDirty {
 			promptText = fmt.Sprintf("%s has changed since chezmoi last wrote it", targetRelPath)
 		} else {
@@ -1212,6 +1292,17 @@ func (c *Config) defaultPreApplyFunc(
 		case choice == "all-overwrite":
 			c.force = true
 			return nil
+		case choice == "accept":
+			// Skip this target during apply and queue it to be re-added into
+			// the source state after the apply loop completes.
+			c.acceptedTargets = append(c.acceptedTargets, targetRelPath)
+			return fs.SkipDir
+		case choice == "all-accept":
+			// As accept, but also accept every subsequent regular-file conflict
+			// this run without prompting.
+			c.acceptAll = true
+			c.acceptedTargets = append(c.acceptedTargets, targetRelPath)
+			return fs.SkipDir
 		case choice == "skip":
 			return fs.SkipDir
 		case choice == "quit":

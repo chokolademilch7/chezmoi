@@ -88,6 +88,30 @@ func (c *Config) runReAddCmd(cmd *cobra.Command, args []string, sourceState *che
 	}
 	slices.SortFunc(targetRelPaths, chezmoi.CompareRelPaths)
 
+	processedFiles, err := c.reAddTargetRelPaths(sourceState, targetRelPaths, sourceStateEntries, c.sourceSystem, false)
+	if err != nil {
+		return err
+	}
+
+	// Process exact directories - add new files and remove deleted files
+	return c.processExactDirs(sourceState, sourceStateEntries, processedFiles)
+}
+
+// reAddTargetRelPaths re-adds the regular-file targets in targetRelPaths into
+// sourceState, writing through sourceSystem. It returns the set of targets that
+// were processed. Targets whose source entry is a template or is not a regular
+// file are skipped; when warnSkipped is true a warning is emitted for each such
+// skip (used by the apply accept drain), otherwise they are skipped silently
+// (preserving the standalone re-add UX). runReAddCmd calls this with
+// c.sourceSystem; the accept drain calls it with c.baseSystem so that source
+// writes bypass the read-only wrapping applied to c.sourceSystem during apply.
+func (c *Config) reAddTargetRelPaths(
+	sourceState *chezmoi.SourceState,
+	targetRelPaths []chezmoi.RelPath,
+	sourceStateEntries map[chezmoi.RelPath]chezmoi.SourceStateEntry,
+	sourceSystem chezmoi.System,
+	warnSkipped bool,
+) (map[chezmoi.RelPath]bool, error) {
 	// Track which files were already processed to avoid double-processing with exact directories
 	processedFiles := make(map[chezmoi.RelPath]bool)
 
@@ -95,12 +119,21 @@ TARGET_REL_PATH:
 	for _, targetRelPath := range targetRelPaths {
 		sourceStateFile, ok := sourceStateEntries[targetRelPath].(*chezmoi.SourceStateFile)
 		if !ok {
+			if warnSkipped {
+				c.errorf("warning: %s: not re-adding: source is not a regular file\n", targetRelPath)
+			}
 			continue
 		}
 		if sourceStateFile.Attr().Template {
+			if warnSkipped {
+				c.errorf("warning: %s: not re-adding: source is a template\n", targetRelPath)
+			}
 			continue
 		}
 		if sourceStateFile.Attr().Type != chezmoi.SourceFileTypeFile {
+			if warnSkipped {
+				c.errorf("warning: %s: not re-adding: source is not a regular file\n", targetRelPath)
+			}
 			continue
 		}
 
@@ -108,7 +141,7 @@ TARGET_REL_PATH:
 		destAbsPathInfo, err := c.destSystem.Stat(destAbsPath)
 		actualState, err := chezmoi.NewActualStateEntry(c.destSystem, destAbsPath, destAbsPathInfo, err)
 		if err != nil {
-			return err
+			return processedFiles, err
 		}
 		actualStateFile, ok := actualState.(*chezmoi.ActualStateFile)
 		if !ok {
@@ -117,7 +150,7 @@ TARGET_REL_PATH:
 
 		targetState, err := sourceStateFile.TargetStateEntry(c.destSystem, c.DestDirAbsPath)
 		if err != nil {
-			return err
+			return processedFiles, err
 		}
 		targetStateFile, ok := targetState.(*chezmoi.TargetStateFile)
 		if !ok {
@@ -126,11 +159,11 @@ TARGET_REL_PATH:
 
 		actualContents, err := actualStateFile.Contents()
 		if err != nil {
-			return err
+			return processedFiles, err
 		}
 		targetContents, err := targetStateFile.Contents()
 		if err != nil {
-			return err
+			return processedFiles, err
 		}
 
 		bytesEqual := bytes.Equal(actualContents, targetContents)
@@ -156,14 +189,14 @@ TARGET_REL_PATH:
 			for {
 				switch choice, err := c.promptChoice(prompt, choices); {
 				case err != nil:
-					return err
+					return processedFiles, err
 				case choice == "diff":
 					if err := c.diffFile(
 						targetRelPath,
 						c.SourceDirAbsPath.Join(sourceStateFile.SourceRelPath().RelPath()), targetContents, targetStateFile.Perm(c.Umask),
 						destAbsPath, actualContents, actualStateFile.Perm(),
 					); err != nil {
-						return err
+						return processedFiles, err
 					}
 				case choice == "yes":
 					break FOR
@@ -173,7 +206,7 @@ TARGET_REL_PATH:
 					c.Interactive = false
 					break FOR
 				case choice == "quit":
-					return chezmoi.ExitCodeError(0)
+					return processedFiles, chezmoi.ExitCodeError(0)
 				default:
 					panic(choice + ": unexpected choice")
 				}
@@ -198,21 +231,20 @@ TARGET_REL_PATH:
 		destAbsPathInfos := map[chezmoi.AbsPath]fs.FileInfo{
 			destAbsPath: destAbsPathInfo,
 		}
-		if err := sourceState.Add(c.sourceSystem, c.persistentState, c.destSystem, destAbsPathInfos, &chezmoi.AddOptions{
+		if err := sourceState.Add(sourceSystem, c.persistentState, c.destSystem, destAbsPathInfos, &chezmoi.AddOptions{
 			Encrypt:         sourceStateFile.Attr().Encrypted,
 			EncryptedSuffix: c.encryption.EncryptedSuffix(),
 			Errorf:          c.errorf,
 			Filter:          c.reAdd.filter,
 			PreAddFunc:      c.defaultPreAddFunc,
 		}); err != nil {
-			return err
+			return processedFiles, err
 		}
 		// Mark this file as processed
 		processedFiles[targetRelPath] = true
 	}
 
-	// Process exact directories - add new files and remove deleted files
-	return c.processExactDirs(sourceState, sourceStateEntries, processedFiles)
+	return processedFiles, nil
 }
 
 // processExactDirs handles exact directory synchronization during re-add.

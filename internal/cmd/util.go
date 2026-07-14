@@ -33,6 +33,19 @@ var (
 		"skip",
 		"quit",
 	}
+	// choicesOverwriteAccept is choicesOverwrite plus the accept/all-accept
+	// choices, offered only for regular-file conflicts (see
+	// defaultPreApplyFunc). The accept/all-accept naming intentionally mirrors
+	// overwrite/all-overwrite so that UniqueAbbreviations keeps the full words
+	// resolvable; a shared prefix between two choices resolves to nothing.
+	choicesOverwriteAccept = []string{
+		"overwrite",
+		"all-overwrite",
+		"accept",
+		"all-accept",
+		"skip",
+		"quit",
+	}
 )
 
 // camelCaseToUpperSnakeCase converts a string in camelCase to UPPER_SNAKE_CASE.
